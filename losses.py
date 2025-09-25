@@ -1,53 +1,46 @@
-# losses.py — ClassBalancedBCELoss (pos/neg 分開加權，長尾友善)
+# losses.py — Class-Balanced BCE for multi-label long-tail
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-def _effective_num_weights(n, beta=0.9999, eps=1e-8):
-    """
-    n: [C] 每類正/負樣本數
-    回傳: [C] 對應的 class weight，n 越小，權重越大。
-    """
-    n = torch.clamp(n.float(), min=1.0)
-    beta = torch.tensor(beta, dtype=torch.float32, device=n.device)
-    weights = (1.0 - beta) / (1.0 - torch.pow(beta, n))
-    weights = weights / (weights.mean() + eps)  # normalize
-    return weights
-
 class ClassBalancedBCELoss(nn.Module):
     """
-    對多標籤 BCE：
-      - 對每個類別的「正樣本」與「負樣本」分別用 effective number 產生權重
-      - 避免只強調正樣本導致 precision 掉光
-    參數：
-      n_pos: [C] 每類別訓練集正樣本數
-      n_neg: [C] 每類別訓練集負樣本數
-      beta:  CB 的 beta，越靠近 1 越強調尾部
+    BCE with per-class weights derived from positive/negative counts to mitigate long-tail.
+    Args:
+      n_pos: Tensor [C] positive counts per class (>=1 to avoid div-by-zero)
+      n_neg: Tensor [C] negative counts per class
+      beta:  in (0,1); effective number weighting if provided (default None uses inverse frequency)
     """
-    def __init__(self, n_pos, n_neg, beta=0.9999, reduction='mean'):
+    def __init__(self, n_pos: torch.Tensor, n_neg: torch.Tensor, beta: float=None, eps: float=1e-8):
         super().__init__()
-        assert n_pos.shape == n_neg.shape
-        self.register_buffer('w_pos', _effective_num_weights(n_pos, beta))
-        self.register_buffer('w_neg', _effective_num_weights(n_neg, beta))
-        self.reduction = reduction
+        device = n_pos.device
+        n_pos = n_pos.clamp_min(1).float()
+        n_neg = n_neg.clamp_min(1).float()
+        if beta is not None and 0.0 < beta < 1.0:
+            # Effective number of samples (Cui et al. 2019)
+            E_pos = (1.0 - torch.pow(beta, n_pos)) / (1.0 - beta + eps)
+            E_neg = (1.0 - torch.pow(beta, n_neg)) / (1.0 - beta + eps)
+            w_pos = (1.0 / (E_pos + eps))
+            w_neg = (1.0 / (E_neg + eps))
+        else:
+            w_pos = (n_neg / (n_pos + n_neg + eps))
+            w_neg = (n_pos / (n_pos + n_neg + eps))
 
-    def forward(self, logits, targets):
-        # logits, targets: [B, C]
-        # 分別計算 pos/neg BCE，再以 per-class 權重線性合成
-        loss_pos = F.binary_cross_entropy_with_logits(
-            logits, torch.ones_like(targets), reduction='none'
-        )  # 當作 y=1 的損失
-        loss_neg = F.binary_cross_entropy_with_logits(
-            logits, torch.zeros_like(targets), reduction='none'
-        )  # 當作 y=0 的損失
+        # Normalize weights so magnitudes are reasonable
+        w_pos = w_pos / (w_pos.mean() + eps)
+        w_neg = w_neg / (w_neg.mean() + eps)
 
-        # 權重展開成 [B, C]
-        w_pos = self.w_pos.view(1, -1)
-        w_neg = self.w_neg.view(1, -1)
+        self.register_buffer('w_pos', w_pos)
+        self.register_buffer('w_neg', w_neg)
+        self.eps = eps
 
-        loss = targets * (w_pos * loss_pos) + (1.0 - targets) * (w_neg * loss_neg)
-        if self.reduction == 'mean':
-            return loss.mean()
-        elif self.reduction == 'sum':
-            return loss.sum()
-        return loss
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor):
+        """
+        logits: [B, C], targets: [B, C] in {0,1}
+        """
+        prob = torch.sigmoid(logits)
+        # Weighted BCE
+        loss_pos = - self.w_pos * (targets * torch.log(prob.clamp_min(self.eps)))
+        loss_neg = - self.w_neg * ((1 - targets) * torch.log((1 - prob).clamp_min(self.eps)))
+        loss = loss_pos + loss_neg
+        return loss.mean()
