@@ -1,127 +1,71 @@
+# confusion.py
 import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
-from model import Net
-from dataset import MultiLabelImageDataset
 import numpy as np
-from tqdm import tqdm     # ✅ 新增進度條
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import confusion_matrix
+from torch.utils.data import DataLoader
+from torchvision import transforms
+from train import MultiBranchTongueNet, TongueDataset   # ⚠️ 從 train.py 匯入
+import pandas as pd
 
-def make_loaders(train_csv, val_csv, img_root, label_cols,
-                 batch_size=64, num_workers=4, img_size=224):
-    train_set = MultiLabelImageDataset(train_csv, img_root, label_cols, train=True, img_size=img_size)
-    val_set   = MultiLabelImageDataset(val_csv, img_root, label_cols, train=False, img_size=img_size)
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True,
-                              num_workers=num_workers, pin_memory=True)
-    val_loader   = DataLoader(val_set,   batch_size=batch_size, shuffle=False,
-                              num_workers=num_workers, pin_memory=True)
-    return train_loader, val_loader
+# 8 個類別
+LABEL_COLS = ["TonguePale", "TipSideRed", "Spot", "Ecchymosis",
+              "Crack", "Toothmark", "FurThick", "FurYellow"]
 
-def compute_pos_weight(train_loader, num_classes, device):
-    counts_pos = torch.zeros(num_classes, device=device)
-    counts_all = 0
-    for _, y in tqdm(train_loader, desc="計算pos_weight", leave=False):
-        y = y.to(device)
-        counts_pos += y.sum(dim=0)
-        counts_all += y.size(0)
-    counts_neg = counts_all - counts_pos
-    pos_weight = (counts_neg / (counts_pos.clamp(min=1.0))).float()
-    return pos_weight
+def main():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-@torch.no_grad()
-def get_head_feat(loader, net, head_idx, device):
-    feats = []
-    net.eval()
-    for x, y in tqdm(loader, desc="蒐集head特徵", leave=False):
-        x = x.to(device)
-        y = y.to(device)
-        mask = (y[:, head_idx].sum(dim=1) > 0)
-        x_head = x[mask]
-        if x_head.numel() > 0:
-            feats.append(net.extract(x_head))
-    return torch.cat(feats, dim=0) if feats else None
+    # ✅ 路徑
+    weights = r"C:\Users\msp\Tongue-AI-V2\multibranch_tongue_fold1.pth"
+    val_csv = r"C:\Users\msp\Tongue-AI-V2\train_fold1.csv"
+    img_dir = r"C:\Users\msp\Tongue-AI-V2\images"
 
-def train_one_epoch(model, loader, criterion, optimizer, device,
-                    head_feat=None, head_idx=None, tail_idx=None, httn_prob=0.5):
-    model.train()
-    running = 0.0
-    # ✅ tqdm 進度條
-    pbar = tqdm(loader, desc="訓練中", leave=False)
-    for x, y in pbar:
-        x = x.to(device)
-        y = y.to(device)
-        fuse_tail = np.random.rand() < httn_prob
-        logits = model(x, h_feat=head_feat, fuse_tail=fuse_tail)
-        loss = criterion(logits, y)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        running += loss.item() * x.size(0)
-        pbar.set_postfix(loss=f"{loss.item():.4f}")
-    return running / len(loader.dataset)
+    # Transform
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor()
+    ])
 
-@torch.no_grad()
-def evaluate(model, loader, device='cuda', thr=0.5):
+    # Dataset / Dataloader
+    ds = TongueDataset(val_csv, img_dir, LABEL_COLS, transform)
+    loader = DataLoader(ds, batch_size=16, shuffle=False)
+
+    # Model
+    model = MultiBranchTongueNet(num_classes=len(LABEL_COLS)).to(device)
+    state = torch.load(weights, map_location=device)
+    model.load_state_dict(state)
     model.eval()
-    from sklearn.metrics import f1_score, average_precision_score
-    all_probs, all_targets = [], []
-    pbar = tqdm(loader, desc="驗證中", leave=False)
-    for x, y in pbar:
-        x = x.to(device)
-        y = y.to(device)
-        logits = model(x)
-        probs = torch.sigmoid(logits)
-        all_probs.append(probs.cpu())
-        all_targets.append(y.cpu())
-    P = torch.cat(all_probs).numpy()
-    T = torch.cat(all_targets).numpy()
-    micro_f1 = f1_score(T, (P >= thr).astype(np.int32), average='micro', zero_division=0)
-    macro_f1 = f1_score(T, (P >= thr).astype(np.int32), average='macro', zero_division=0)
-    mAP = average_precision_score(T, P, average='macro')
-    return micro_f1, macro_f1, mAP
 
-def main_img():
-    label_cols = ["TonguePale", "TipSideRed", "Spot", "Ecchymosis",
-                  "Crack", "Toothmark", "FurThick", "FurYellow"]
-    num_classes = len(label_cols)
-    head_idx = list(range(6))
-    tail_idx = list(range(6, 8))
+    all_preds, all_labels = [], []
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"使用裝置: {device}")
+    with torch.no_grad():
+        for imgs, labels in loader:
+            imgs = [x.to(device) for x in imgs]
+            labels = labels.numpy()
 
-    train_loader, val_loader = make_loaders(
-        train_csv='train_fold1.csv',
-        val_csv='val_fold1.csv',
-        img_root='C:/Users/msp/Tongue-AI-V2/images',
-        label_cols=label_cols,
-        batch_size=64,
-        num_workers=4,
-        img_size=224
-    )
+            # 預測
+            logits = model(imgs)
+            probs = torch.sigmoid(logits).cpu().numpy()
 
-    model = Net(num_classes=num_classes, norm=True, scale=True,
-                backbone='resnet50', pretrained=True,
-                head_idx=head_idx, tail_idx=tail_idx).to(device)
+            # argmax → 單一類別
+            preds = np.argmax(probs, axis=1)
+            true_labels = np.argmax(labels, axis=1)
 
-    pos_weight = compute_pos_weight(train_loader, num_classes, device)
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4)
+            all_preds.extend(preds)
+            all_labels.extend(true_labels)
 
-    head_feat = get_head_feat(train_loader, model, head_idx, device)
+    # 混淆矩陣
+    cm = confusion_matrix(all_labels, all_preds, labels=list(range(len(LABEL_COLS))))
 
-    best_micro_f1 = 0.0
-    for epoch in range(10):
-        print(f"\n==== Epoch {epoch} ====")
-        loss = train_one_epoch(model, train_loader, criterion, optimizer, device,
-                               head_feat=head_feat, head_idx=head_idx,
-                               tail_idx=tail_idx, httn_prob=0.5)
-        micro, macro, mAP = evaluate(model, val_loader, device=device)
-        print(f"[Epoch {epoch}] loss={loss:.4f} | microF1={micro:.4f} | macroF1={macro:.4f} | mAP={mAP:.4f}")
-        if micro > best_micro_f1:
-            best_micro_f1 = micro
-            torch.save({'state_dict': model.state_dict(), 'epoch': epoch},
-                       'model_best_img_httn.pth')
-            print("✅ 新最佳模型已儲存")
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+                xticklabels=LABEL_COLS,
+                yticklabels=LABEL_COLS)
+    plt.xlabel("Predicted")
+    plt.ylabel("True")
+    plt.title("8x8 Confusion Matrix")
+    plt.show()
 
-if __name__ == '__main__':
-    main_img()
+if __name__ == "__main__":
+    main()
